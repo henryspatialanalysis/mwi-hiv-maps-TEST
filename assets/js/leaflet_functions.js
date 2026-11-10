@@ -1,0 +1,535 @@
+// Helper functions to render outcomes in labels ---------------------------------------->
+// Create comma-separated numbers
+function cma(outcome) {
+  const rounded = Math.round(outcome/10) * 10;
+  return rounded.toLocaleString(undefined, {maximumFractionDigits: 10});
+}
+// Create percentage strings with `decimals` digits after the point
+function pct(outcome, decimals = 1, suffix = true) {
+  const suffixMark = suffix ? "%" : "";
+  return (outcome * 100).toFixed(decimals) + suffixMark;
+}
+
+// Feature properties ------------------------------------------------------------------->
+
+// Polygon layers carry their properties on each GeoJSON feature. The H3 layer instead
+// stores one array per column (`props`, from data/<District>.js) and each feature holds
+// only its row index `i`. This returns a plain {column: value} object either way.
+function feature_props(feature, props){
+  if(!props) return feature.properties;
+  const i = feature.properties.i;
+  const out = {};
+  for(const [col, values] of Object.entries(props)) out[col] = values[i];
+  return out;
+}
+
+// Missing values arrive as null (the R side writes NA as null)
+function is_missing(value){
+  return value === null || value === undefined || Number.isNaN(value);
+}
+const NA_COLOR = '#bbbbbb';
+
+// Build hexagon polygons for the H3 layer from its cell ids, using h3-js. The result is
+// cached on the data object so the three maps on a district page share one copy.
+function h3_to_geojson(h3_data){
+  if(h3_data.geojson) return h3_data.geojson;
+  h3_data.geojson = {
+    type: 'FeatureCollection',
+    features: h3_data.ids.map((id, i) => ({
+      type: 'Feature',
+      properties: {i: i},
+      geometry: {type: 'Polygon', coordinates: [h3.cellToBoundary(id, true)]}
+    }))
+  };
+  return h3_data.geojson;
+}
+
+// Create labels for map *polygons* ----------------------------------------------------->
+
+function poly_tooltip(layer, ind_suffix = '', columnar_props = null){
+  const props = feature_props(layer.feature, columnar_props);
+  const cols = Object.keys(props);
+  const LOW_POP_CUTOFF = 50;
+
+  // Add potential place titles
+  var inner_html = '';
+  var titles = [];
+  const titleLabels = {
+    gvhname: 'GVH: ',
+    taname: '',
+    catchment_name: '',
+    survey_facility_name: '',
+  }
+  Object.entries(titleLabels).forEach(([key, label]) => {
+    if(cols.includes(key)){
+      titles.push(`<b>${label}${props[key]}</b>`);
+    }
+  });
+  inner_html += titles.join('<br/>');
+  if(inner_html != ''){
+    inner_html += '<br/>';
+  }
+
+  // Add indicators to labels
+  var labs = [];
+  const indLabels = {
+    vr: 'HIV viraemia',
+    pr: 'HIV prevalence',
+    vl: 'Viral load suppression'
+  };
+  Object.entries(indLabels).forEach(([ind, indLabel]) => {
+    // Viraemia values are an order of magnitude smaller, so show one more digit
+    const acc = ind === 'vr' ? 2 : 1;
+    const meanVar = `${ind}_m${ind_suffix}`;
+    const uiVars = [`${ind}_l${ind_suffix}`, `${ind}_u${ind_suffix}`];
+    if (!cols.includes(meanVar)) return;
+    var this_lab = `<i>${indLabel}</i>: `;
+    if (is_missing(props[meanVar])) {
+      this_lab += '<i>not estimated</i>';
+    } else {
+      this_lab += pct(props[meanVar], acc);
+      if (uiVars.every(v => cols.includes(v))) {
+        this_lab += ` (${pct(props[uiVars[0]], acc)} to ${pct(props[uiVars[1]], acc)})`;
+      }
+    }
+    labs.push(this_lab);
+  });
+
+  // Censor outcomes for small populations
+  if (cols.includes('pop_15to49')) {
+    if(props.pop_15to49 < LOW_POP_CUTOFF) {
+      labs = [`<i>Population</i>: < ${cma(LOW_POP_CUTOFF)}`];
+    } else {
+      labs.push(`<i>Population (15 to 49)</i>: ${cma(props.pop_15to49)}`);
+    }
+  }
+  inner_html += labs.join('<br/>');
+
+  return inner_html;
+}
+
+// Create popup labels for map *points* ------------------------------------------------->
+
+// Lines whose value is missing from the data file are left out rather than shown as
+// "undefined" (excluded facilities, for example, have no catchment population).
+function point_popup(layer){
+  const props = layer.feature.properties;
+  const lines = [`<b>${props.facility_name}</b>`];
+  const add = (label, value) => {
+    if(!is_missing(value)) lines.push(`<i>${label}:</i> ${value}`);
+  };
+  add('Type', props.facility_type);
+  if(!is_missing(props.taname)) add('Location', `${props.taname} (${props.restype})`);
+  add('Services', props.services);
+  if(!is_missing(props.art_cumulative)){
+    add('ART cohort (Q4 2024)', cma(props.art_cumulative));
+  }
+  if(!is_missing(props.pop_15to49)){
+    add('Catchment population (15 to 49)', cma(props.pop_15to49));
+  }
+  return lines.join('<br/>');
+}
+
+
+// Create popup labels for district boundaries ------------------------------------------>
+
+function district_popup(layer){
+  const props = layer.feature.properties;
+  var inner_html = `
+    <a href="./${props['area_name']}.html"><b>${props['area_name']}</b></a>
+  `;
+  return inner_html;
+}
+
+// Function to add a legend to the map -------------------------------------------------->
+
+function prepare_legend(options){
+  const default_options = {
+    legend_title: null,
+    className: 'leaflet-legend',
+    legend_breaks: ['Lowest', 'Highest'],
+    fill_palette: [
+      '#0D0887FF','#3E049CFF','#6300A7FF','#8707A6FF','#A62098FF','#C03A83FF','#D5546EFF',
+      '#E76F5AFF','#F58C46FF','#FDAD32FF','#FCD225FF','#F0F921FF'
+    ],
+    opacity: 0.8
+  };
+  options = {...default_options, ...options};
+
+  // Reverse labels and palette
+  let rev_labels = [...options.legend_breaks].reverse();
+  let rev_palette = [...options.fill_palette].reverse();
+
+  let div = L.DomUtil.create("div", options.className);
+  // Optionally add title
+  if(options.legend_title){
+    let title_div = L.DomUtil.create("div");
+    title_div.innerHTML = "<strong>" + options.legend_title + "</strong>";
+    title_div.style.marginBottom = "3px";
+    div.appendChild(title_div);
+  }
+
+  // Formatting variables
+  let vMargin = 8; // If 1st tick mark starts at top of gradient, how
+  // many extra px are needed for the top half of the
+  // 1st label? (ditto for last tick mark/label)
+  let tickWidth = 4;     // How wide should tick marks be, in px?
+  let labelPadding = 2;  // How much distance to reserve for tick mark?
+  // Each bin is `singleBinHeight` high. How tall is the gradient?
+  let totalHeight = 151;
+  // The distance between tick marks, in px
+  let singleBinHeight = (totalHeight - 1) / (rev_labels.length - 1);
+
+  let gradSpan = document.createElement("span");
+  Object.assign(gradSpan.style, {
+    background: `linear-gradient(${rev_palette})`,
+    opacity: options.opacity,
+    height: totalHeight + "px",
+    width: "30px",
+    display: "block",
+    marginTop: vMargin + "px"
+  });
+
+  let leftDiv = document.createElement("div");
+  leftDiv.style.float = "left";
+  let rightDiv = document.createElement("div");
+  rightDiv.style.float = "left";
+
+  leftDiv.appendChild(gradSpan);
+  div.appendChild(leftDiv);
+  div.appendChild(rightDiv);
+  div.appendChild(document.createElement("br"));
+
+  // Have to attach the div to the body at this early point, so that the
+  // svg text getComputedTextLength() actually works, below.
+  document.body.appendChild(div);
+
+  let ns = "http://www.w3.org/2000/svg";
+  let svg = document.createElementNS(ns, "svg");
+  rightDiv.appendChild(svg);
+  let g = document.createElementNS(ns, "g");
+  g.setAttribute("transform", "translate(0, " + vMargin + ")");
+  svg.appendChild(g);
+
+  // max label width needed to set width of svg, and right-justify text
+  let maxLblWidth = 0;
+
+  // Create tick marks and labels
+  rev_labels.forEach((label, i) => {
+    let y = i*singleBinHeight + 0.5;
+
+    let thisLabel = document.createElementNS(ns, "text");
+    thisLabel.textContent = label;
+    thisLabel.setAttribute("y", y);
+    thisLabel.setAttribute("dx", tickWidth + labelPadding);
+    thisLabel.setAttribute("dy", "0.5ex");
+    g.appendChild(thisLabel);
+    maxLblWidth = Math.max(maxLblWidth, thisLabel.getComputedTextLength());
+
+    let thisTick = document.createElementNS(ns, "line");
+    thisTick.setAttribute("x1", 0);
+    thisTick.setAttribute("x2", tickWidth);
+    thisTick.setAttribute("y1", y);
+    thisTick.setAttribute("y2", y);
+    thisTick.setAttribute("stroke-width", 1);
+    thisTick.setAttribute("stroke", "black");
+    g.appendChild(thisTick);
+  });
+
+  // Final size for <svg>
+  Object.assign(svg.style, {
+    width: (maxLblWidth + labelPadding) + "px",
+    height: totalHeight + vMargin*2 + "px"
+  });
+
+  // Return the legend div
+  return div;
+}
+
+
+// Helper function to create a GeoJSON layer for Leaflet -------------------------------->
+
+function new_geojson(data, options){
+  const default_options = {
+    weight: 0,
+    overlayWeight: 0.7,
+    color: '#777777',
+    ind_suffix: '',
+    type: 'polygons',
+    interactive: true,
+    overlay: false,
+    tooltip: true,
+    use_pop_for_opacity: true,
+    props: null  // columnar property table for H3 layers; see feature_props()
+  };
+  options = {...default_options, ...options};
+  let fill_column = options.use_col + options.ind_suffix;
+  let fill_scale = (chroma
+    .scale(options.fill_palette)
+    .domain([options.lower, options.upper])
+  );
+  const fill_color = (value) => is_missing(value) ? NA_COLOR : fill_scale(value).hex();
+  var fill_opacity_fun = (_) => 0.5;
+  if(options.use_pop_for_opacity){
+    fill_opacity_fun = (pop) => {
+      return pop >= options.pop_cutoff_high ? 0.8 :
+        pop <= options.pop_cutoff_low ? 0.2 :
+        0.5;
+    }
+  }
+  let style_fun = null
+  if(options.overlay){
+    style_fun = (feature) => {
+      return {
+        weight: options.overlayWeight,
+        color: options.color,
+        fillOpacity: 0
+      };
+    }
+  } else {
+    style_fun = (feature) => {
+      const props = feature_props(feature, options.props);
+      return {
+        weight: options.weight,
+        color: options.color,
+        fillColor: fill_color(props[fill_column]),
+        fillOpacity: fill_opacity_fun(props['pop_15to49'])
+      };
+    }
+  }
+  let onEachFeature = null;
+  if(options.interactive){
+    onEachFeature = (_, layer) => {
+      layer.on('mouseover', function(){
+        layer.setStyle({
+        weight: 4,
+        color: '#000000',
+      });
+      layer.bringToFront();
+    });
+      let base_style = null;
+      layer.on('mouseout', () => {
+        if(base_style === null) base_style = style_fun(layer.feature);
+        layer.setStyle(base_style);
+      });
+    };
+  }
+  let geojsonLayer = L
+    .geoJSON(
+      data,
+      {style: style_fun, interactive: options.interactive, onEachFeature: onEachFeature}
+    )
+  if(options.interactive && options.tooltip){
+    geojsonLayer.bindTooltip(
+      (layer) => poly_tooltip(layer, options.ind_suffix, options.props)
+    );
+  }
+  return geojsonLayer
+}
+
+
+// Basemap: OpenFreeMap vector tiles rendered by MapLibre GL inside Leaflet ------------->
+
+const BASEMAP_STYLE_URL = 'https://tiles.openfreemap.org/styles/positron';
+const BASEMAP_ATTRIBUTION = (
+  '<a href="https://openfreemap.org">OpenFreeMap</a> ' +
+  '&copy; <a href="https://www.openmaptiles.org/">OpenMapTiles</a>, ' +
+  'data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+);
+
+// The style JSON is fetched once per page and shared by every map on it
+let basemap_style_promise = null;
+function get_basemap_style(){
+  if(basemap_style_promise === null){
+    basemap_style_promise = fetch(BASEMAP_STYLE_URL).then((resp) => resp.json());
+  }
+  return basemap_style_promise;
+}
+
+// Style layers drawn *above* the data: place labels, administrative boundaries, major
+// roads and railways. Everything else (land, water, buildings, minor roads) is drawn
+// beneath the data.
+function is_overlay_style_layer(layer){
+  if(layer.type === 'symbol') return true;
+  if(layer.type !== 'line') return false;
+  const source_layer = layer['source-layer'];
+  if(source_layer === 'boundary') return true;
+  if(source_layer === 'transportation'){
+    return /^(highway_(motorway|major)|railway|tunnel_motorway)/.test(layer.id);
+  }
+  return false;
+}
+
+// Split one MapLibre style into a base style and an overlay style. Both share the same
+// sources, glyphs and sprite, so tiles are fetched once and served from cache after.
+function split_basemap_style(style){
+  return {
+    base: {...style, layers: style.layers.filter((l) => !is_overlay_style_layer(l))},
+    overlay: {...style, layers: style.layers.filter(is_overlay_style_layer)}
+  };
+}
+
+// Fallback for browsers without WebGL (MapLibre needs it): plain OpenStreetMap raster
+// tiles beneath the data, with no labels overlay.
+function add_raster_fallback(map){
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    pane: 'tilePane',
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+  }).addTo(map);
+}
+
+function webgl_available(){
+  try {
+    const canvas = document.createElement('canvas');
+    return !!(canvas.getContext('webgl2') || canvas.getContext('webgl'));
+  } catch(err) {
+    return false;
+  }
+}
+
+// Add the basemap to a Leaflet map. With `labels_above` (the default), labels, borders
+// and major roads are drawn in a dedicated pane that sits just above the data in
+// overlayPane and that never intercepts pointer events, so tooltips keep working.
+function add_basemap(map, options){
+  const default_options = {labels_above: true};
+  options = {...default_options, ...options};
+  if(!webgl_available()){
+    console.warn('WebGL unavailable; using OpenStreetMap raster tiles instead.');
+    add_raster_fallback(map);
+    return;
+  }
+  get_basemap_style().then((style) => {
+    const split = split_basemap_style(style);
+    L.maplibreGL({
+      style: split.base,
+      pane: 'tilePane',
+      attributionControl: {customAttribution: BASEMAP_ATTRIBUTION}
+    }).addTo(map);
+    if(options.labels_above){
+      if(!map.getPane('basemapLabels')){
+        const pane = map.createPane('basemapLabels');
+        pane.style.zIndex = 450;
+        pane.style.pointerEvents = 'none';
+      }
+      L.maplibreGL({
+        style: split.overlay,
+        pane: 'basemapLabels',
+        attributionControl: false
+      }).addTo(map);
+    }
+  }).catch((err) => {
+    console.warn('Could not load the basemap; using OpenStreetMap raster tiles instead.', err);
+    add_raster_fallback(map);
+  });
+}
+
+// Helper: a layer group that builds its contents on first use ------------------------->
+
+// `build` returns an array of Leaflet layers. It runs the first time the group is added
+// to a map (for example, when its radio button is selected in the layer control).
+function lazy_layer_group(build){
+  const group = L.layerGroup();
+  let built = false;
+  group.on('add', () => {
+    if(built) return;
+    built = true;
+    build().forEach((layer) => group.addLayer(layer));
+  });
+  return group;
+}
+
+// Template to create a leaflet map ----------------------------------------------------->
+
+// Assumes the div with id map already exists
+function create_district_map(id, bounds, options) {
+  // Indicator defaults come from viz_defaults.js, which must be loaded before this call
+  const default_options = {...default_viz_options.prevalence, zoom_min: 10};
+  options = {...default_options, ...options};
+
+  // Create map. The canvas renderer avoids one SVG <path> per H3 cell, which for the
+  // largest districts adds up to tens of thousands of DOM nodes per map.
+  const map = L.map(id, {zoomSnap: 0.2, maxZoom: 18, preferCanvas: true});
+  const bounds_keys = Object.keys(bounds);
+
+  // Add basemap
+  add_basemap(map);
+
+  // Add district boundaries
+  const district_layer = L.geoJSON(bounds.district, {
+    style: {
+      color: 'black',
+      fillOpacity: 0,
+      weight: 2
+    }
+  }).addTo(map);
+  map.fitBounds(district_layer.getBounds());
+  if(map.getZoom() < options.zoom_min){
+    map.setView(map.getCenter(), options.zoom_min);
+  }
+
+  // The H3 layer arrives as cell ids plus a column table; hexagons are built here (once
+  // per page) and every resolution layer recolours the same hexagons by a different
+  // column suffix.
+  const h3_geojson = h3_to_geojson(bounds.h3);
+  const h3_options = {...options, props: bounds.h3.props};
+
+  // Create all toggleable resolution layers. Only the initially visible layer is built
+  // now; the others are layer groups that build their contents the first time they are
+  // selected in the layer control.
+  var base_layers = {};
+  base_layers['High resolution'] = new_geojson(
+    h3_geojson, {...h3_options, weight: 0.15}
+  ).addTo(map);
+  base_layers['Group village head'] = lazy_layer_group(() => [
+    new_geojson(h3_geojson, {...h3_options, interactive: false, ind_suffix: '_gvh'}),
+    new_geojson(bounds.gvh, {...options, overlay: true, ind_suffix: '_gvh'})
+  ]);
+  base_layers['Traditional authority'] = lazy_layer_group(() => [
+    new_geojson(h3_geojson, {...h3_options, interactive: false, ind_suffix: '_ta'}),
+    new_geojson(bounds.ta, {...options, overlay: true})
+  ]);
+  base_layers['Facility catchment'] = lazy_layer_group(() => [
+    new_geojson(h3_geojson, {...h3_options, interactive: false, ind_suffix: '_facility'}),
+    new_geojson(
+      bounds.facility_catchments, {...options, overlay: true, ind_suffix: '_facility'}
+    )
+  ]);
+
+  // Add layers that may not exist: survey facilities
+  if(bounds_keys.includes('survey_facilities')){
+    base_layers['Survey facilities'] = lazy_layer_group(() => [
+      new_geojson(h3_geojson, {...h3_options, interactive: false, ind_suffix: '_scf'}),
+      new_geojson(bounds.survey_facilities, {...options, overlay: true, ind_suffix: '_scf'})
+    ]);
+  }
+
+  // Add optional layers:
+  var optional_layers = {};
+  optional_layers['Health facility locations'] = L
+    .geoJSON(bounds.facility_points)
+    .bindPopup((layer) => point_popup(layer));
+  if(bounds_keys.includes('dropped_facility_points')){
+    optional_layers['<i>(Excluded health facilities)</i>'] = L
+      .geoJSON(bounds.dropped_facility_points)
+      .bindPopup((layer) => point_popup(layer));
+  }
+  const catch_title = 'Facility catchment<br/>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;boundaries';
+  optional_layers[catch_title] = L.geoJSON(
+    bounds.facility_catchments, {
+      style: {opacity: 0.85, color: "#0000FF", dashArray: "5, 10", fillOpacity: 0},
+      interactive: false,
+      pane: 'shadowPane'
+    }
+  );
+  const layerControl = L.control.layers(base_layers, optional_layers, {collapsed: false});
+  layerControl.addTo(map);
+
+  // Add legend
+  var legend = L.control({position: 'bottomright'});
+  legend.onAdd = function(_){
+    const div = prepare_legend(options);
+    return div;
+  };
+  legend.addTo(map);
+}

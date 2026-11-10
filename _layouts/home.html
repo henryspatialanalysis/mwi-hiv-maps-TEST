@@ -1,0 +1,34 @@
+---
+layout: default
+---
+
+<div class="home">
+  {%- if page.title -%}
+    <h1 class="page-heading">{{ page.title }}</h1>
+  {%- endif -%}
+
+  {{ content }}
+
+  <div id="national-map" class="leaflet-map"></div>
+
+  {%- if site.districts.size > 0 -%}
+    <h2 class="post-list-heading">Districts</h2>
+    <ul class="post-list">
+      {%- for district_page in site.districts -%}
+      <li>
+        <a class="post-link" href="{{ district_page.url | relative_url }}">
+          {{ district_page.title | escape }}
+        </a>
+      </li>
+      {%- endfor -%}
+    </ul>
+  {%- endif -%}
+
+  <!-- End of page content -->
+
+  <script src="{{ '/assets/js/leaflet_functions.js' | relative_url }}"></script>
+  <script src="{{ '/data/national.js' | relative_url }}"></script>
+  <script src="{{ '/assets/js/build_national_map.js' | relative_url }}"></script>
+
+
+</div>
